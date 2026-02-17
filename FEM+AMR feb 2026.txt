@@ -1,0 +1,189 @@
+cd("D:/Julia")
+
+using Gridap, Gridap.Geometry, Gridap.Adaptivity
+using DataStructures
+
+# =========================================================
+# Analytical solution
+# =========================================================
+u_exact(x) = exp(-x[1]^2 - x[2]^2)
+
+# For -Δu = f and u_exact = exp(-(x^2+y^2)):
+# Δu = (4x^2 + 4y^2 - 4)exp(-(x^2+y^2))
+# => f = -Δu = (4 - 4(x^2+y^2))exp(-(x^2+y^2))
+f_rhs(x) = (4 - 4*(x[1]^2 + x[2]^2)) * exp(-x[1]^2 - x[2]^2)
+
+# =========================================================
+# Domain
+# =========================================================
+domain = (-2, 2, -2, 2)
+n_cells = (10, 10)  # initial mesh resolution
+model = simplexify(CartesianDiscreteModel(domain, n_cells))
+
+# =========================================================
+# Norm helpers
+# =========================================================
+
+# Local contributions (for estimator -> estimate)
+l2_loc(he, xh, dΩ) = ∫(he*(xh*xh))*dΩ
+l2_loc(xh, dΩ)     = ∫(xh*xh)*dΩ
+
+# Global scalar norms (for benchmarks)
+l2_sq(xh, dΩ)      = sum(∫(xh*xh)*dΩ)
+h1_semi_sq(xh, dΩ) = sum(∫(∇(xh)⋅∇(xh))*dΩ)
+
+# =========================================================
+# AMR step function
+# =========================================================
+function amr_step(model, u_exact; order=2, theta=0.9)
+  # FE spaces with Dirichlet BC
+  reffe = ReferenceFE(lagrangian, Float64, order)
+  V = TestFESpace(model, reffe; dirichlet_tags=["boundary"])
+  U = TrialFESpace(V, u_exact)
+
+  # Geometry
+  Ω = Triangulation(model)
+  Γ = Boundary(model)
+  Λ = Skeleton(model)
+
+  # Measures
+  dΩ = Measure(Ω, 4*order)
+  dΓ = Measure(Γ, 2*order)
+  dΛ = Measure(Λ, 2*order)
+
+  # Cell sizes
+  hK = CellField(sqrt.(collect(get_array(∫(1)dΩ))), Ω)
+
+  # Normals
+  nΓ = get_normal_vector(Γ)
+  nΛ = get_normal_vector(Λ)
+
+  # Exact gradient
+  ∇u(x) = ∇(u_exact)(x)
+
+  # Weak form for -Δu = f
+  a(u,v) = ∫(∇(u)⋅∇(v))dΩ
+  l(v)   = ∫(f_rhs*v)dΩ
+
+  # Residual-based estimator (local terms only)
+  ηh(u) = l2_loc(hK*(f_rhs + Δ(u)), dΩ) +        # volume residual
+          l2_loc(hK*(∇(u) - ∇u)⋅nΓ, dΓ) +        # boundary term
+          l2_loc(jump(hK*∇(u)⋅nΛ), dΛ)           # interface jump
+
+  # Solve
+  op = AffineFEOperator(a, l, U, V)
+  uh = solve(op)
+
+  # Indicators
+  η = estimate(ηh, uh)
+
+  # Mark and refine
+  m = DorflerMarking(theta)
+  I = Adaptivity.mark(m, η)
+
+  method = Adaptivity.NVBRefinement(model)
+  amodel = refine(method, model; cells_to_refine=I)
+  fmodel = Adaptivity.get_model(amodel)
+
+  # Old scalar error (kept for compatibility)
+  error = sum(l2_loc(uh - u_exact, dΩ))
+
+  return fmodel, uh, η, I, error
+end
+
+# =========================================================
+# Main loop (max 20 steps + early stop by rel_H1)
+# + per-iteration timing
+# =========================================================
+max_steps = 100
+order = 2
+tol_rel_H1 = 1e-3
+
+final_rel_L2 = NaN
+final_rel_H1 = NaN
+final_eta_sum = NaN
+steps_done = 0
+
+uh_final = nothing
+model_for_uh = nothing   # model where uh_final is defined
+
+iter_times = Float64[]   # seconds per iteration
+t_total_start = time()
+
+for i in 1:max_steps
+  t_iter_start = time()
+
+  # uh is computed on current model
+  current_model = model
+
+  fmodel, uh, η, I, error = amr_step(model, u_exact; order=order, theta=0.9)
+
+  # Benchmarks on current mesh
+  Ω = Triangulation(current_model)
+  dΩ = Measure(Ω, 4*order)
+
+  e = uh - u_exact
+  u_ex_cf = CellField(u_exact, Ω)
+
+  rel_L2 = sqrt(l2_sq(e, dΩ) / l2_sq(u_ex_cf, dΩ))
+  rel_H1 = sqrt(h1_semi_sq(e, dΩ) / h1_semi_sq(u_ex_cf, dΩ))
+  eta_sum = sum(η)
+
+  t_iter = time() - t_iter_start
+  push!(iter_times, t_iter)
+
+  println("Step $i | time=$(round(t_iter,digits=3)) s | rel_L2=$rel_L2 | rel_H1=$rel_H1 | eta_sum=$eta_sum")
+
+  final_rel_L2 = rel_L2
+  final_rel_H1 = rel_H1
+  final_eta_sum = eta_sum
+  steps_done = i
+
+  uh_final = uh
+  model_for_uh = current_model
+
+  model = fmodel
+
+  if rel_H1 <= tol_rel_H1
+    println("✅ Early stop: rel_H1=$rel_H1 <= $tol_rel_H1")
+    break
+  end
+end
+
+t_total = time() - t_total_start
+avg_iter_time = isempty(iter_times) ? NaN : sum(iter_times) / length(iter_times)
+
+println("====================================")
+println("Done in steps: $steps_done")
+println("Total time (s): $(round(t_total,digits=3))")
+println("Average iter time (s): $(round(avg_iter_time,digits=3))")
+println("Iteration times (s): ", round.(iter_times, digits=3))
+println("Final rel_L2  = $final_rel_L2")
+println("Final rel_H1  = $final_rel_H1")
+println("Final eta_sum = $final_eta_sum")
+println("====================================")
+
+# =========================================================
+# Save final results to VTU
+# =========================================================
+if uh_final === nothing || model_for_uh === nothing
+  error("Нет финального решения для записи в VTU.")
+end
+
+Ωf = Triangulation(model_for_uh)
+
+u_exact_cf = CellField(u_exact, Ωf)
+abs_error_cf = abs(uh_final - u_exact)
+sq_error_cf  = (uh_final - u_exact) * (uh_final - u_exact)
+
+writevtk(
+  Ωf, "final_result", append=false,
+  cellfields = [
+    "uh"        => uh_final,
+    "u_exact"   => u_exact_cf,
+    "abs_error" => abs_error_cf,
+    "sq_error"  => sq_error_cf,
+  ],
+)
+
+println("VTU saved: final_result.vtu")
